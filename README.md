@@ -23,9 +23,7 @@ Please cite the original reference:
 Cell Reports (2024), S2211-1247(24)01155-0.
 
 
-====================================================================================================
-======================================Data, Methods & Parameters============================================
-============================================================================================================
+================Data, Methods & Parameters=========
     Samples downloaded: KDP02, KDP06 (scRNA-seq); NBO001, NBO002, NBO004, NBO006 (snRNA-seq)
     Total raw barcodes: 72,652 across 6 samples
     QC thresholds: nFeature 500–6000, nCount 1000–50000, percent.mt < 10%
@@ -38,6 +36,7 @@ Cell Reports (2024), S2211-1247(24)01155-0.
     Seurat version: 5.5.0 (pipeline written for v4, minor compatibility fixes applied)
     UMAP: R-native UWOT (not Python umap-learn)
 ============================================================================================================
+
 GSE253865_NBAtlas_scRNAseq/
 ├── README.md
 ├── LICENSE
@@ -61,4 +60,5 @@ GSE253865_NBAtlas_scRNAseq/
 └── docs/
     ├── study_description.md
     └── workflow_overview.md
+    
 ==============================================================================================================
