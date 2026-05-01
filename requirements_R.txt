@@ -1,0 +1,85 @@
+==================Requiremenmts:=============================
+Seurat>=5.0.0
+ggplot2>=3.4.0
+dplyr>=1.1.0
+Matrix
+patchwork
+tibble
+scales
+NMF
+BiocManager
+SingleR
+celldex
+SingleCellExperiment
+
+==============================================================
+
+# R Package Requirements
+This project was developed and tested using R (version 4.3 or later). The following CRAN and Bioconductor packages are required to reproduce the complete single-cell RNA-seq analysis workflow for GSE253865.
+
+## CRAN Packages
+
+* Seurat (>= 5.0.0)
+* ggplot2 (>= 3.4.0)
+* dplyr (>= 1.1.0)
+* Matrix
+* patchwork
+* tibble
+* scales
+* NMF
+
+## Bioconductor Packages
+
+* BiocManager
+* SingleR
+* celldex
+* SingleCellExperiment
+
+## Installation
+
+```r
+# Install CRAN packages
+install.packages(c(
+  "Seurat",
+  "ggplot2",
+  "dplyr",
+  "Matrix",
+  "patchwork",
+  "tibble",
+  "scales",
+  "NMF"
+))
+
+# Install Bioconductor packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c(
+  "SingleR",
+  "celldex",
+  "SingleCellExperiment"
+))
+```
+
+## Optional Recommended Packages
+
+* future (for parallel processing)
+* harmony (alternative batch correction)
+* cowplot (enhanced figure composition)
+* data.table (faster data handling)
+
+## System Requirements
+
+* R version 4.3.0 or higher
+* Recommended RAM: 16 GB minimum (32 GB preferred for full integration mode)
+* Operating Systems: Linux, macOS, or Windows
+* Multi-core CPU recommended for faster processing
+
+## Notes
+
+* Quick mode can be used for rapid exploratory analysis on systems with limited memory.
+* Full RPCA-based integration is recommended for publication-quality analyses.
+* All package versions should be recorded using `sessionInfo()` for reproducibility.
+
+
+
