@@ -64,26 +64,47 @@ Cell Reports (2024), S2211-1247(24)01155-0.
 GSE253865_NBAtlas_scRNAseq/
 
 ├── README.md
+
 ├── LICENSE
+
 ├── CITATION.cff
+
 ├── acknowledgment.md
+
 ├── requirements/
+
 │   ├── R_sessionInfo.txt
+
 │   ├── conda_environment.yml
+
 │   └── package_versions.md
+
 ├── input/
-│   ├── GEO_GSE253865/                # raw 10x matrices or links
-│   └── metadata/                     # sample sheet, if any
+
+│   ├── GEO_GSE253865/   
+                                        # raw 10x matrices or links
+│   └── metadata/  
+                                        # sample sheet, if any
 ├── code/
+
 │   ├── 01_run_pipeline.R
+
 │   ├── 02_make_figures.R
+
 │   └── 03_export_pdf.R
+
 ├── output/
+
 │   ├── figures/
+
 │   ├── tables/
+
 │   └── seurat_object/
+
 └── docs/
     ├── study_description.md
+    
     └── workflow_overview.md
+   
     
 ====================
