@@ -1,0 +1,690 @@
+# Concise Pipeline
+1. Load 10x matrices from GSE253865.
+2. Create Seurat objects for each sample.
+3. Compute QC metrics (genes, UMIs, mitochondrial fraction).
+4. Filter low-quality cells.
+5. Normalize and identify variable genes.
+6. Dimensionality reduction (PCA, UMAP).
+7. Graph-based clustering.
+8. Annotate clusters using canonical marker programs and/or SingleR.
+9. Generate NBAtlas-style figures:
+   - Panel A: Sample summary
+   - Panel B: UMAP overview
+   - Panel C: Annotated cell types
+   - Panel D: Marker dot plot
+10. Export Seurat object, metadata, and publication figures.
+
+
+================================Code======================================
+#!/usr/bin/env Rscript
+
+# =========================================================
+# NBAtlas-inspired scRNA-seq Pipeline for Single GEO Dataset
+# =========================================================
+# Adapted for GSE253865 only.
+# Produces:
+#  - Panel A: sample / assay / cell summary
+#  - Panel B: UMAP colored by dataset, assay, sample
+#  - Panel C: annotated cell-type UMAP
+#  - Panel D: marker dot plot by annotated cell type
+
+options(stringsAsFactors = FALSE)
+set.seed(1234)
+quick_mode <- TRUE
+
+# -----------------------------
+# 1. Setup and Libraries
+# -----------------------------
+script_args <- commandArgs(trailingOnly = FALSE)
+script_file <- sub("^--file=", "", script_args[grep("^--file=", script_args)])
+
+if (length(script_file) > 0 && file.exists(script_file)) {
+  data_dir <- dirname(normalizePath(script_file))
+  project_root <- normalizePath(file.path(data_dir, "..", "..", ".."))
+} else {
+  # Fallback for interactive execution from repo root or NBAtlas folder
+  if (dir.exists(file.path(getwd(), "NBAtlas", "data", "GEO_GSE253865"))) {
+    project_root <- normalizePath(getwd())
+    data_dir <- file.path(project_root, "NBAtlas", "data", "GEO_GSE253865")
+  } else if (dir.exists(file.path(getwd(), "data", "GEO_GSE253865"))) {
+    project_root <- normalizePath(getwd())
+    data_dir <- file.path(project_root, "data", "GEO_GSE253865")
+  } else {
+    stop("Could not resolve GEO_GSE253865 data directory from current context.")
+  }
+}
+
+output_dir <- file.path(data_dir, "output")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+local_lib <- file.path(project_root, ".Rlibs")
+if (dir.exists(local_lib)) {
+  .libPaths(c(normalizePath(local_lib), .libPaths()))
+}
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(Matrix)
+  library(patchwork)
+  library(tibble)
+  library(scales)
+
+  cran_packages <- c("NMF")
+  bioc_packages <- c("SingleR", "celldex", "SingleCellExperiment")
+
+  for (pkg in cran_packages) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      message("Installing CRAN package: ", pkg)
+      install.packages(pkg, repos = "https://cloud.r-project.org/")
+    }
+    suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+  }
+
+  if (length(bioc_packages) > 0) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) {
+      install.packages("BiocManager", repos = "https://cloud.r-project.org/")
+    }
+    for (pkg in bioc_packages) {
+      if (!requireNamespace(pkg, quietly = TRUE)) {
+        message("Installing Bioconductor package: ", pkg)
+        BiocManager::install(pkg, ask = FALSE, update = FALSE)
+      }
+      suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+    }
+  }
+})
+
+theme_set(
+  theme_bw(base_size = 12) +
+    theme(
+      panel.grid = element_blank(),
+      axis.title = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", hjust = 0),
+      legend.title = element_text(face = "bold")
+    )
+)
+
+celltype_marker_list <- list(
+  Neuroendocrine = c("PHOX2B", "NXPH1", "SYT1"),
+  Endothelial = c("EGFL7", "EMCN", "PLVAP"),
+  Schwann = c("CDH19", "PLP1", "PTPRZ1"),
+  Fibroblast = c("COL1A1", "COL1A2", "COL3A1"),
+  `T cell` = c("CD3D", "CD3E", "CD2"),
+  `NK cell` = c("KLRF1", "KLRC1", "XCL2"),
+  `B cell` = c("MS4A1", "CD79A", "VPREB3"),
+  Plasma = c("IGHG1", "IGHG2", "IGHG3"),
+  Myeloid = c("LYZ", "IL1B", "C1QC"),
+  pDC = c("LILRA4", "SCT", "PTCRA"),
+  RBCs = c("HBA1", "HBA2", "HBB"),
+  `Stromal other` = c("CYP11B1", "CYP21A2", "FAM166B")
+)
+
+ordered_celltypes <- names(celltype_marker_list)
+
+detect_assay_type <- function(sample_name) {
+  lower_name <- tolower(sample_name)
+  if (grepl("nuc|snrna|single_nucleus|single-nucleus", lower_name)) {
+    "single_nucleus"
+  } else {
+    "single_cell"
+  }
+}
+
+make_safe_levels <- function(x, prefix = "g") {
+  x <- as.character(x)
+  x <- gsub("[^A-Za-z0-9]+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  x <- ifelse(grepl("^[0-9]", x), paste0(prefix, x), x)
+  x
+}
+
+save_plot <- function(plot_obj, filename, width, height, dpi = 300) {
+  ggsave(
+    filename = file.path(output_dir, filename),
+    plot = plot_obj,
+    width = width,
+    height = height,
+    dpi = dpi,
+    bg = "white"
+  )
+}
+
+# -----------------------------
+# 2. Load Sample Data
+# -----------------------------
+sample_files <- list.files(data_dir, pattern = "barcodes.tsv.gz$", full.names = TRUE)
+sample_names <- sub("_barcodes.tsv.gz$", "", basename(sample_files))
+
+if (length(sample_names) == 0) {
+  stop("No 10x-style files found in: ", data_dir)
+}
+
+message("Found ", length(sample_names), " samples: ", paste(sample_names, collapse = ", "))
+
+seurat_list <- vector("list", length(sample_names))
+names(seurat_list) <- sample_names
+sample_summary <- list()
+
+for (sample_name in sample_names) {
+  message("Loading sample: ", sample_name)
+
+  barcode_file <- file.path(data_dir, paste0(sample_name, "_barcodes.tsv.gz"))
+  feature_file <- file.path(data_dir, paste0(sample_name, "_features.tsv.gz"))
+  matrix_file <- file.path(data_dir, paste0(sample_name, "_matrix.mtx.gz"))
+
+  cts <- ReadMtx(
+    mtx = matrix_file,
+    features = feature_file,
+    cells = barcode_file
+  )
+
+  seu <- CreateSeuratObject(
+    counts = cts,
+    project = sample_name,
+    min.cells = 3,
+    min.features = 200
+  )
+
+  seu$sample <- sample_name
+  seu$dataset <- "GSE253865"
+  seu$assay_type <- detect_assay_type(sample_name)
+
+  sample_summary[[sample_name]] <- tibble(
+    sample = sample_name,
+    dataset = "GSE253865",
+    assay_type = unique(seu$assay_type),
+    raw_cells = ncol(seu),
+    raw_genes = nrow(seu)
+  )
+
+  seurat_list[[sample_name]] <- seu
+}
+
+sample_summary_df <- bind_rows(sample_summary)
+write.csv(sample_summary_df, file.path(output_dir, "00_sample_summary_raw.csv"), row.names = FALSE)
+
+# -----------------------------
+# 3. Merge Samples
+# -----------------------------
+message("Merging samples...")
+merged_seurat <- merge(
+  x = seurat_list[[1]],
+  y = seurat_list[-1],
+  add.cell.ids = names(seurat_list),
+  project = "NBAtlas_GSE253865"
+)
+
+message("Merged object: ", ncol(merged_seurat), " cells, ", nrow(merged_seurat), " features")
+
+# -----------------------------
+# 4. QC Metrics
+# -----------------------------
+message("Computing QC metrics...")
+merged_seurat[["percent.mt"]] <- PercentageFeatureSet(merged_seurat, pattern = "^MT-")
+merged_seurat[["percent.rb"]] <- PercentageFeatureSet(merged_seurat, pattern = "^RP[SL]")
+
+p_qc_vln <- VlnPlot(
+  merged_seurat,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  ncol = 3,
+  pt.size = 0.05
+)
+p_qc_nf <- FeatureScatter(merged_seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + NoLegend()
+p_qc_mt <- FeatureScatter(merged_seurat, feature1 = "nCount_RNA", feature2 = "percent.mt") + NoLegend()
+
+save_plot(p_qc_vln, "01_QC_violin.png", 12, 6)
+save_plot(p_qc_nf, "02_QC_scatter_features.png", 6, 6)
+save_plot(p_qc_mt, "03_QC_scatter_mt.png", 6, 6)
+
+# -----------------------------
+# 5. Filtering
+# -----------------------------
+cells_before <- ncol(merged_seurat)
+merged_seurat <- subset(
+  merged_seurat,
+  subset = nFeature_RNA > 500 & nFeature_RNA < 6000 &
+    nCount_RNA > 1000 & nCount_RNA < 50000 &
+    percent.mt < 10
+)
+cells_after <- ncol(merged_seurat)
+message("Filtering: ", cells_before, " -> ", cells_after, " cells")
+
+if (quick_mode) {
+  current_cells <- ncol(merged_seurat)
+  max_cells_per_sample <- 3500
+  Idents(merged_seurat) <- "sample"
+  merged_seurat <- subset(merged_seurat, downsample = max_cells_per_sample)
+  message("Quick mode downsampling: ", current_cells, " -> ", ncol(merged_seurat), " cells")
+}
+
+# -----------------------------
+# 6. Integration + Clustering
+# -----------------------------
+message("Running integrated Seurat workflow with RPCA...")
+if (quick_mode) {
+  message("Quick mode: skipping RPCA integration; running direct PCA/UMAP workflow.")
+  DefaultAssay(merged_seurat) <- "RNA"
+  merged_seurat <- NormalizeData(merged_seurat, verbose = FALSE)
+  merged_seurat <- FindVariableFeatures(merged_seurat, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+  merged_seurat <- ScaleData(merged_seurat, verbose = FALSE)
+  merged_seurat <- RunPCA(merged_seurat, npcs = 30, verbose = FALSE)
+  merged_seurat <- RunUMAP(merged_seurat, dims = 1:20, verbose = FALSE)
+  merged_seurat <- FindNeighbors(merged_seurat, dims = 1:20, verbose = FALSE)
+  merged_seurat <- FindClusters(merged_seurat, resolution = c(0.5, 0.8), verbose = FALSE)
+} else {
+  seurat_split <- SplitObject(merged_seurat, split.by = "sample")
+  seurat_split <- lapply(seurat_split, function(x) {
+    x <- NormalizeData(x, verbose = FALSE)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 3000, verbose = FALSE)
+    x <- ScaleData(x, verbose = FALSE)
+    x <- RunPCA(x, npcs = 50, verbose = FALSE)
+    x
+  })
+
+  features <- SelectIntegrationFeatures(object.list = seurat_split, nfeatures = 3000)
+  anchors <- FindIntegrationAnchors(
+    object.list = seurat_split,
+    anchor.features = features,
+    reduction = "rpca",
+    dims = 1:30
+  )
+
+  merged_seurat <- IntegrateData(anchorset = anchors, dims = 1:30)
+
+  DefaultAssay(merged_seurat) <- "integrated"
+  merged_seurat <- ScaleData(merged_seurat, verbose = FALSE)
+  merged_seurat <- RunPCA(merged_seurat, npcs = 50, verbose = FALSE)
+  merged_seurat <- RunUMAP(merged_seurat, dims = 1:30, verbose = FALSE)
+  merged_seurat <- FindNeighbors(merged_seurat, dims = 1:30, verbose = FALSE)
+  merged_seurat <- FindClusters(merged_seurat, resolution = c(0.5, 0.8), verbose = FALSE)
+}
+
+# -----------------------------
+# 7. RNA normalization for markers / annotation
+# -----------------------------
+DefaultAssay(merged_seurat) <- "RNA"
+merged_seurat <- NormalizeData(merged_seurat, verbose = FALSE)
+merged_seurat <- FindVariableFeatures(merged_seurat, selection.method = "vst", nfeatures = 3000, verbose = FALSE)
+
+# -----------------------------
+# 8. Reference annotation with SingleR
+# -----------------------------
+message("Running SingleR reference annotation...")
+if (quick_mode) {
+  merged_seurat$cell_type_hpca <- NA_character_
+} else {
+  hpca_ref <- celldex::HumanPrimaryCellAtlasData()
+  rna_sce <- as.SingleCellExperiment(merged_seurat, assay = "RNA")
+  singleR_pred <- SingleR(
+    test = rna_sce,
+    ref = hpca_ref,
+    labels = hpca_ref$label.main
+  )
+  merged_seurat$cell_type_hpca <- singleR_pred$labels
+}
+
+# -----------------------------
+# 9. Marker-based cluster annotation
+# -----------------------------
+message("Assigning NBAtlas-style cell-type labels from marker programs...")
+
+used_prior_annotations <- FALSE
+prior_annotation_file <- file.path(output_dir, "clustering_results.csv")
+if (quick_mode && file.exists(prior_annotation_file)) {
+  prior_anno <- read.csv(prior_annotation_file, stringsAsFactors = FALSE, check.names = FALSE) %>%
+    select(cell_id, cell_type_manual) %>%
+    distinct(cell_id, .keep_all = TRUE) %>%
+    mutate(
+      cell_type_manual = case_when(
+        tolower(cell_type_manual) %in% c("neuroendocrine", "ne") ~ "Neuroendocrine",
+        tolower(cell_type_manual) %in% c("endothelial") ~ "Endothelial",
+        tolower(cell_type_manual) %in% c("schwann") ~ "Schwann",
+        tolower(cell_type_manual) %in% c("fibroblast") ~ "Fibroblast",
+        tolower(cell_type_manual) %in% c("tcell", "t cell") ~ "T cell",
+        tolower(cell_type_manual) %in% c("nk", "nk cell") ~ "NK cell",
+        tolower(cell_type_manual) %in% c("bcell", "b cell") ~ "B cell",
+        tolower(cell_type_manual) %in% c("plasma") ~ "Plasma",
+        tolower(cell_type_manual) %in% c("myeloid") ~ "Myeloid",
+        tolower(cell_type_manual) %in% c("pdc") ~ "pDC",
+        tolower(cell_type_manual) %in% c("rbcs", "rbc") ~ "RBCs",
+        tolower(cell_type_manual) %in% c("stromal other", "stromal_other", "stromal") ~ "Stromal other",
+        TRUE ~ "Stromal other"
+      )
+    )
+  merged_seurat@meta.data <- merged_seurat@meta.data %>%
+    tibble::rownames_to_column("cell_id") %>%
+    left_join(prior_anno, by = "cell_id") %>%
+    mutate(cell_type_manual = ifelse(is.na(cell_type_manual), "Stromal other", cell_type_manual)) %>%
+    tibble::column_to_rownames("cell_id")
+  merged_seurat$cell_type_manual <- factor(merged_seurat$cell_type_manual, levels = ordered_celltypes)
+  used_prior_annotations <- TRUE
+  write.csv(
+    as.data.frame(table(cluster = merged_seurat$RNA_snn_res.0.5, cell_type = merged_seurat$cell_type_manual)),
+    file.path(output_dir, "05_cluster_celltype_mapping.csv"),
+    row.names = FALSE
+  )
+} else {
+  present_marker_list <- lapply(celltype_marker_list, function(x) intersect(x, rownames(merged_seurat)))
+  present_marker_list <- present_marker_list[lengths(present_marker_list) >= 2]
+
+  if (length(present_marker_list) < 2) {
+    stop("Too few published NBAtlas markers are present in this dataset for robust annotation.")
+  }
+
+  score_prefixes <- paste0("ct_", make_safe_levels(names(present_marker_list), prefix = "ct"))
+  for (i in seq_along(present_marker_list)) {
+    merged_seurat <- AddModuleScore(
+      object = merged_seurat,
+      features = list(present_marker_list[[i]]),
+      name = paste0(score_prefixes[i], "_"),
+      assay = "RNA",
+      search = FALSE
+    )
+  }
+
+  score_cols <- paste0(score_prefixes, "_1")
+  score_df <- FetchData(
+    merged_seurat,
+    vars = c("RNA_snn_res.0.5", score_cols)
+  ) %>%
+    rename(cluster = RNA_snn_res.0.5)
+
+  cluster_score_df <- score_df %>%
+    group_by(cluster) %>%
+    summarise(across(all_of(score_cols), mean), .groups = "drop")
+
+  best_idx <- apply(cluster_score_df[, score_cols, drop = FALSE], 1, which.max)
+  cluster_score_df$cell_type_manual <- names(present_marker_list)[best_idx]
+
+  cluster_annotation_map <- cluster_score_df %>%
+    select(cluster, cell_type_manual)
+
+  merged_seurat@meta.data <- merged_seurat@meta.data %>%
+    tibble::rownames_to_column("cell_id") %>%
+    left_join(cluster_annotation_map, by = c("RNA_snn_res.0.5" = "cluster")) %>%
+    tibble::column_to_rownames("cell_id")
+
+  merged_seurat$cell_type_manual <- factor(
+    merged_seurat$cell_type_manual,
+    levels = ordered_celltypes
+  )
+
+  write.csv(cluster_score_df, file.path(output_dir, "04_cluster_marker_program_scores.csv"), row.names = FALSE)
+  write.csv(
+    as.data.frame(table(cluster = merged_seurat$RNA_snn_res.0.5, cell_type = merged_seurat$cell_type_manual)),
+    file.path(output_dir, "05_cluster_celltype_mapping.csv"),
+    row.names = FALSE
+  )
+}
+
+# -----------------------------
+# 10. Marker gene analysis
+# -----------------------------
+markers <- NULL
+if (!quick_mode) {
+  Idents(merged_seurat) <- "RNA_snn_res.0.5"
+  markers <- FindAllMarkers(
+    merged_seurat,
+    assay = "RNA",
+    only.pos = TRUE,
+    min.pct = 0.25,
+    logfc.threshold = 0.25
+  )
+  write.csv(markers, file = file.path(output_dir, "cluster_markers.csv"), row.names = FALSE)
+
+  top10 <- markers %>%
+    group_by(cluster) %>%
+    slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE)
+
+  p_heatmap <- DoHeatmap(merged_seurat, features = unique(top10$gene), assay = "RNA") + NoLegend()
+  p_marker_dot <- DotPlot(merged_seurat, features = unique(top10$gene), assay = "RNA") + RotatedAxis()
+
+  save_plot(p_heatmap, "18_marker_heatmap.png", 14, 10)
+  save_plot(p_marker_dot, "19_marker_dotplot.png", 14, 8)
+}
+
+# -----------------------------
+# 11. Standard UMAP outputs
+# -----------------------------
+if (!quick_mode) {
+  DefaultAssay(merged_seurat) <- "integrated"
+
+  p_pca <- DimPlot(merged_seurat, reduction = "pca", group.by = "sample")
+  p_umap_res05 <- DimPlot(merged_seurat, reduction = "umap", group.by = "RNA_snn_res.0.5", label = TRUE, repel = TRUE)
+  p_umap_res08 <- DimPlot(merged_seurat, reduction = "umap", group.by = "RNA_snn_res.0.8", label = TRUE, repel = TRUE)
+  p_umap_hpca <- DimPlot(merged_seurat, reduction = "umap", group.by = "cell_type_hpca", label = FALSE) + guides(colour = guide_legend(override.aes = list(size = 3)))
+
+  save_plot(p_pca, "12_pca_umap.png", 10, 8)
+  save_plot(p_umap_res05, "13_umap_clusters_res05.png", 10, 8)
+  save_plot(p_umap_res08, "14_umap_clusters_res08.png", 10, 8)
+  save_plot(p_umap_hpca, "15_umap_celltypes_hpca.png", 12, 10)
+
+  merged_seurat$malignant_status <- ifelse(merged_seurat$cell_type_manual == "Neuroendocrine", "tumor", "normal")
+  p_malignant <- DimPlot(merged_seurat, reduction = "umap", group.by = "malignant_status")
+  save_plot(p_malignant, "17_umap_malignant_vs_normal.png", 10, 8)
+}
+
+# -----------------------------
+# 12. Cluster proportions
+# -----------------------------
+if (!quick_mode) {
+  prop <- prop.table(table(merged_seurat$sample, merged_seurat$RNA_snn_res.0.5), 1)
+  prop <- as.data.frame(prop)
+  colnames(prop) <- c("sample", "cluster", "proportion")
+
+  p_prop <- ggplot(prop, aes(sample, proportion, fill = cluster)) +
+    geom_col(width = 0.8) +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  save_plot(p_prop, "20_cluster_proportions.png", 12, 8)
+}
+
+# -----------------------------
+# 13. NBAtlas-style Figure A
+# -----------------------------
+cells_after_filter_df <- merged_seurat@meta.data %>%
+  dplyr::count(sample, assay_type, name = "cells_after_qc")
+
+panelA_df <- sample_summary_df %>%
+  left_join(cells_after_filter_df, by = c("sample", "assay_type")) %>%
+  mutate(
+    cells_after_qc = ifelse(is.na(cells_after_qc), 0, cells_after_qc),
+    sample = factor(sample, levels = sample_summary_df$sample)
+  )
+
+panelA_left <- ggplot(panelA_df, aes(x = sample, y = cells_after_qc, fill = assay_type)) +
+  geom_col(width = 0.8, color = "grey20") +
+  scale_fill_manual(values = c(single_cell = "#2C7FB8", single_nucleus = "#F2C14E")) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "A  Included samples in GSE253865",
+    x = "Sample",
+    y = "Cells after QC",
+    fill = "Assay"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+
+panelA_right_df <- tibble(
+  metric = c("Dataset", "Samples", "Assays", "Cells after QC"),
+  value = c(
+    "GSE253865",
+    as.character(length(unique(panelA_df$sample))),
+    paste(sort(unique(panelA_df$assay_type)), collapse = ", "),
+    comma(sum(panelA_df$cells_after_qc))
+  )
+ ) %>%
+  mutate(y_pos = rev(seq_len(n())))
+
+panelA_right <- ggplot(panelA_right_df, aes(x = 1, y = y_pos)) +
+  geom_tile(fill = "grey96", color = "grey70", width = 0.95, height = 0.9) +
+  geom_text(aes(label = metric), x = 0.32, hjust = 0, fontface = "bold", size = 4) +
+  geom_text(aes(label = value), x = 0.72, hjust = 0, size = 4) +
+  xlim(0, 1.15) +
+  labs(title = "Summary") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", hjust = 0))
+
+panelA_plot <- panelA_left + panelA_right + plot_layout(widths = c(3.4, 1.6))
+save_plot(panelA_plot, "NBAtlas_style_A_included_samples.png", 14, 6)
+save_plot(panelA_plot, "Figure_A.png", 14, 6)
+write.csv(panelA_df, file.path(output_dir, "A_included_samples_table.csv"), row.names = FALSE)
+write.csv(panelA_right_df, file.path(output_dir, "A_summary_metrics_table.csv"), row.names = FALSE)
+
+# -----------------------------
+# 14. NBAtlas-style Figure B
+# -----------------------------
+panelB_dataset <- DimPlot(merged_seurat, reduction = "umap", group.by = "dataset", raster = FALSE) +
+  labs(title = "Dataset") +
+  theme(plot.title = element_text(face = "bold"))
+
+panelB_assay <- DimPlot(merged_seurat, reduction = "umap", group.by = "assay_type", raster = FALSE) +
+  scale_color_manual(values = c(single_cell = "#2C7FB8", single_nucleus = "#F2C14E")) +
+  labs(title = "Assay") +
+  theme(plot.title = element_text(face = "bold"))
+
+panelB_sample <- DimPlot(merged_seurat, reduction = "umap", group.by = "sample", raster = FALSE, label = FALSE) +
+  labs(title = "Sample") +
+  theme(plot.title = element_text(face = "bold"))
+
+panelB_plot <- (panelB_dataset / panelB_assay / panelB_sample) +
+  plot_annotation(title = "B  UMAP overview")
+
+save_plot(panelB_dataset, "B_umap_by_dataset.png", 10, 8)
+save_plot(panelB_assay, "B_umap_by_assay.png", 10, 8)
+save_plot(panelB_sample, "B_umap_by_sample.png", 10, 8)
+save_plot(panelB_plot, "NBAtlas_style_B_umap_overview.png", 10, 16)
+save_plot(panelB_plot, "Figure_B.png", 10, 16)
+umap_df <- Embeddings(merged_seurat, "umap") %>% as.data.frame()
+if ("umap_1" %in% colnames(umap_df)) {
+  colnames(umap_df)[colnames(umap_df) == "umap_1"] <- "UMAP_1"
+}
+if ("umap_2" %in% colnames(umap_df)) {
+  colnames(umap_df)[colnames(umap_df) == "umap_2"] <- "UMAP_2"
+}
+umap_df <- umap_df %>%
+  tibble::rownames_to_column("cell_id") %>%
+  left_join(
+    merged_seurat@meta.data %>%
+      tibble::rownames_to_column("cell_id") %>%
+      select(cell_id, dataset, assay_type, sample, cell_type_manual, RNA_snn_res.0.5),
+    by = "cell_id"
+  )
+write.csv(umap_df, file.path(output_dir, "B_umap_coordinates_with_metadata.csv"), row.names = FALSE)
+
+# -----------------------------
+# 15. NBAtlas-style Figure C
+# -----------------------------
+label_df <- umap_df %>%
+  filter(!is.na(cell_type_manual)) %>%
+  group_by(cell_type_manual) %>%
+  summarise(
+    UMAP_1 = median(UMAP_1),
+    UMAP_2 = median(UMAP_2),
+    .groups = "drop"
+  )
+
+panelC_plot <- ggplot(umap_df, aes(UMAP_1, UMAP_2, color = cell_type_manual)) +
+  stat_ellipse(aes(group = cell_type_manual), linewidth = 0.4, show.legend = FALSE, type = "norm", level = 0.75, alpha = 0.35) +
+  geom_point(size = 0.18, alpha = 0.65) +
+  geom_label(
+    data = label_df,
+    aes(label = cell_type_manual),
+    color = "black",
+    fill = alpha("white", 0.85),
+    label.size = 0.2,
+    size = 3.2,
+    show.legend = FALSE
+  ) +
+  labs(
+    title = "C  Annotated cell types",
+    x = "UMAP 1",
+    y = "UMAP 2",
+    color = "Cell type"
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+
+save_plot(panelC_plot, "NBAtlas_style_C_celltype_umap.png", 12, 10)
+save_plot(panelC_plot, "Figure_C.png", 12, 10)
+write.csv(label_df, file.path(output_dir, "C_celltype_label_positions.csv"), row.names = FALSE)
+write.csv(
+  umap_df %>% dplyr::count(cell_type_manual, sort = TRUE, name = "n_cells"),
+  file.path(output_dir, "C_celltype_counts.csv"),
+  row.names = FALSE
+)
+
+# -----------------------------
+# 16. NBAtlas-style Figure D
+# -----------------------------
+selected_markers <- unique(unlist(celltype_marker_list, use.names = FALSE))
+selected_present <- intersect(selected_markers, rownames(merged_seurat))
+panelD_plot <- ggplot() + theme_void() + labs(title = "D  Published cell-type markers not available")
+
+if (length(selected_present) > 0) {
+  DefaultAssay(merged_seurat) <- "RNA"
+  Idents(merged_seurat) <- "cell_type_manual"
+
+  panelD_dot <- DotPlot(
+    merged_seurat,
+    features = selected_present,
+    group.by = "cell_type_manual",
+    assay = "RNA"
+  )
+
+  panelD_plot <- panelD_dot +
+    RotatedAxis() +
+    labs(
+      title = "D  Published cell-type markers",
+      x = "Marker",
+      y = "Cell type"
+    ) +
+    scale_color_gradient2(low = "#c7d4ff", mid = "#f7f7f7", high = "red2", midpoint = 0.5) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      axis.text.y = element_text(face = "bold")
+    )
+
+  write.csv(panelD_dot$data, file.path(output_dir, "D_marker_dotplot_values.csv"), row.names = FALSE)
+  write.csv(
+    tibble(marker = selected_present) %>%
+      left_join(
+        if (!is.null(markers)) {
+          markers %>% group_by(gene) %>% summarise(max_avg_log2FC = max(avg_log2FC, na.rm = TRUE), .groups = "drop")
+        } else {
+          tibble(gene = character(), max_avg_log2FC = numeric())
+        },
+        by = c("marker" = "gene")
+      ),
+    file.path(output_dir, "D_marker_presence_and_max_log2FC.csv"),
+    row.names = FALSE
+  )
+}
+save_plot(panelD_plot, "NBAtlas_style_D_marker_dotplot.png", 16, 7)
+save_plot(panelD_plot, "Figure_D.png", 16, 7)
+
+# -----------------------------
+# 17. Combined NBAtlas-style summary figure
+# -----------------------------
+combined_plot <- (panelA_plot / (panelB_plot | panelC_plot) / panelD_plot) +
+  plot_layout(heights = c(0.9, 1.6, 0.9))
+
+save_plot(combined_plot, "NBAtlas_style_combined_ABCD.png", 18, 22)
+
+# -----------------------------
+# 18. Save object and metadata
+# -----------------------------
+DefaultAssay(merged_seurat) <- "RNA"
+saveRDS(merged_seurat, file.path(output_dir, "GSE253865_integrated_annotated_seurat.rds"))
+write.csv(
+  merged_seurat@meta.data %>% tibble::rownames_to_column("cell_id"),
+  file.path(output_dir, "GSE253865_cell_metadata.csv"),
+  row.names = FALSE
+)
+
+message("Pipeline completed successfully.")
+message("NBAtlas-style outputs saved in: ", output_dir)
+
